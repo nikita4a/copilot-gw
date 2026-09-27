@@ -234,6 +234,48 @@ def test_models_route_uses_cache_within_ttl():
     assert fake.models_calls == 1  # second served from cache
 
 
+def test_chat_strips_github_prefix_to_copilot():
+    """github:<id> is the explicit copilot escape hatch (no default routing)."""
+    fake = FakeClient()
+    fake.chat_responses.append(FakeResp(200, json.dumps({"choices": []})))
+    app = make_app(fake)
+    resp = asyncio.run(http_post(app, "/v1/chat/completions",
+                                 chat_body(model="github:gpt-5-mini")))
+    assert resp.status == 200
+    assert fake.chat_calls[0][2]["model"] == "gpt-5-mini"
+
+
+def test_chat_github_prefix_still_normalized():
+    fake = FakeClient()
+    fake.chat_responses.append(FakeResp(200, json.dumps({"choices": []})))
+    app = make_app(fake)
+    asyncio.run(http_post(app, "/v1/chat/completions",
+                          chat_body(model="github:claude-opus-4.6[1m]")))
+    assert fake.chat_calls[0][2]["model"] == "claude-opus-4-6"
+
+
+def test_messages_strips_github_prefix():
+    fake = FakeClient()
+    fake.messages_responses.append(FakeResp(200, json.dumps(
+        {"type": "message", "content": [{"type": "text", "text": "ok"}]})))
+    app = make_app(fake)
+    body = {"model": "github:claude-opus-4.6", "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]}
+    resp = asyncio.run(http_post(app, "/v1/messages", body))
+    assert resp.status == 200
+    assert fake.messages_calls[0][2]["model"] == "claude-opus-4-6"
+
+
+def test_default_route_without_providers_is_unchanged_copilot():
+    """No vercel/puter configured -> even vendor-shaped ids stay copilot."""
+    fake = FakeClient()
+    fake.chat_responses.append(FakeResp(200, json.dumps({"choices": []})))
+    app = make_app(fake)
+    asyncio.run(http_post(app, "/v1/chat/completions",
+                          chat_body(model="anthropic/claude-opus-4.5")))
+    assert fake.chat_calls[0][2]["model"] == "anthropic/claude-opus-4.5"
+
+
 # --- HTTP: chat completions -----------------------------------------------
 
 def test_chat_nonstream_passthrough_and_rotation():

@@ -222,11 +222,13 @@ def test_list_models_without_key_skips_network():
 # --- gateway integration --------------------------------------------------
 
 
-def _app(vercel_responses=None, key="vk-1", catalog=("anthropic/claude-opus-4.5",)):
+def _app(vercel_responses=None, key="vk-1", catalog=("anthropic/claude-opus-4.5",),
+         puter=None, warm_cache=True):
     """build_app with a fake copilot pool + injected vercel provider.
 
-    The catalog is seeded into the cache (no network); the FakeSession queue
-    carries only what a test schedules.
+    The catalog is seeded into the cache (no network; warm_cache=False leaves
+    it cold so a test can queue the /models response itself). The FakeSession
+    queue carries only what a test schedules.
     """
     import gateway
     fake = FakeClient()
@@ -238,10 +240,23 @@ def _app(vercel_responses=None, key="vk-1", catalog=("anthropic/claude-opus-4.5"
     s.responses.extend(vercel_responses or [])
     provider = make_gateway(key=key, session=s)
     provider.models_cache = {
-        "entries": [{"id": m, "name": m} for m in catalog],
-        "fetched_at": time.time() if key else 0.0,
+        "entries": [{"id": m, "name": m} for m in catalog] if warm_cache else None,
+        "fetched_at": time.time(),
     }
-    return gateway.build_app(pool=make_pool(fake), vercel=provider), fake, s
+    return (gateway.build_app(pool=make_pool(fake), vercel=provider, puter=puter),
+            fake, s)
+
+
+def _puter_stub(catalog=("gpt-6-luna",), responses=None, fallback=True):
+    """Puter provider with a seeded catalog, for precedence tests."""
+    from puter import PuterProvider
+    ps = FakeSession()
+    ps.responses.extend(responses or [])
+    p = PuterProvider(["pt-1"], session=ps)
+    p.fallback = fallback
+    p.models_cache = {"entries": [{"id": m} for m in catalog],
+                      "ids": set(catalog), "fetched_at": time.time()}
+    return p, ps
 
 
 async def _http(client, method, path, payload=None):
@@ -374,7 +389,8 @@ def test_gateway_vercel_429_maps_to_rate_limit():
 
 
 def test_gateway_copilot_path_unaffected_by_vercel():
-    """Non-prefixed models never touch the vercel provider."""
+    """A bare id the vercel catalog doesn't know (and without vendor '/') is
+    still copilot's — the new default route only fires on a catalog match."""
     app, fake, s = _app()
 
     async def go(client):
@@ -385,4 +401,189 @@ def test_gateway_copilot_path_unaffected_by_vercel():
     assert resp.status == 200
     assert json.loads(resp.body)["choices"][0]["message"]["content"] == \
         "copilot-answer"
+    assert s.calls == []
+
+
+# --- default routing (no prefix): vercel -> puter -> copilot ---------------
+
+
+def test_resolve_matches_catalog_and_shape():
+    g = make_gateway(session=FakeSession())
+    g.models_cache = {"entries": [{"id": "anthropic/claude-opus-4.5"},
+                                  {"id": "openai/gpt-4o"}],
+                      "fetched_at": time.time()}
+
+    async def go():
+        return (await g.resolve("anthropic/claude-opus-4.5"),   # exact
+                await g.resolve("gpt-4o"),                      # vendor suffix
+                await g.resolve("mistral/large"),               # vendor/model
+                await g.resolve("gpt-5.6-luna"),                # copilot id
+                await g.resolve("vercel:openai/gpt-4o"),        # prefixed
+                await g.resolve(""))                            # empty
+
+    exact, suffix, shaped, miss, prefixed, empty = asyncio.run(go())
+    assert exact == "anthropic/claude-opus-4.5"
+    assert suffix == "openai/gpt-4o"
+    assert shaped == "mistral/large"
+    assert miss is None and prefixed is None and empty is None
+
+
+def test_resolve_prefers_matching_vendor_on_ambiguous_suffix():
+    g = make_gateway(session=FakeSession())
+    g.models_cache = {"entries": [{"id": "deepseek/deepseek-r1"},
+                                  {"id": "openai/deepseek-r1"}],
+                      "fetched_at": time.time()}
+    assert asyncio.run(g.resolve("deepseek-r1")) == "deepseek/deepseek-r1"
+
+
+def test_resolve_without_key_is_inert():
+    s = FakeSession()
+    g = make_gateway(key="", session=s)
+    assert asyncio.run(g.resolve("anthropic/claude-opus-4.5")) is None
+    assert s.calls == []                    # no catalog fetch either
+
+
+def test_resolve_warms_cold_catalog_once():
+    s = FakeSession()
+    s.responses.append(FakeResp(200, json.dumps(
+        catalog_body("anthropic/claude-opus-4.5"))))
+    g = make_gateway(session=s)
+    g.models_cache = {"entries": None, "fetched_at": 0.0}
+    assert asyncio.run(g.resolve("claude-opus-4.5")) == \
+        "anthropic/claude-opus-4.5"
+    assert asyncio.run(g.resolve("claude-opus-4.5")) == \
+        "anthropic/claude-opus-4.5"
+    assert len([c for c in s.calls if c["method"] == "get"]) == 1  # cached
+
+
+def test_gateway_default_bare_model_routes_to_vercel():
+    """Owner policy: copilot is the last resort — claude-opus-4.5 goes vercel."""
+    app, fake, s = _app(vercel_responses=[FakeResp(200, json.dumps(
+        completion_body(content="vercel-default")))])
+
+    async def go(client):
+        return await _http(client, "post", "/v1/chat/completions",
+                          {"model": "claude-opus-4.5", "messages": MESSAGES})
+
+    resp = asyncio.run(_go(app, go))
+    assert resp.status == 200
+    assert json.loads(resp.body)["choices"][0]["message"]["content"] == \
+        "vercel-default"
+    assert fake.chat_calls == []                       # copilot skipped
+    # dotted catalog id survives: normalization must not mangle the match
+    assert json.loads(s.calls[0]["data"])["model"] == "anthropic/claude-opus-4.5"
+
+
+def test_gateway_default_exact_vendor_model_routes_to_vercel():
+    app, fake, s = _app(vercel_responses=[FakeResp(200, json.dumps(
+        completion_body()))])
+
+    async def go(client):
+        return await _http(client, "post", "/v1/chat/completions",
+                          {"model": "anthropic/claude-opus-4.5",
+                           "messages": MESSAGES})
+
+    resp = asyncio.run(_go(app, go))
+    assert resp.status == 200
+    assert fake.chat_calls == []
+    assert json.loads(s.calls[0]["data"])["model"] == "anthropic/claude-opus-4.5"
+
+
+def test_gateway_default_vercel_beats_puter_fallback():
+    puter, ps = _puter_stub(catalog=("gpt-6-luna",))
+    app, fake, s = _app(puter=puter, catalog=("vendor/gpt-6-luna",),
+                        vercel_responses=[FakeResp(200, json.dumps(
+                            completion_body("vendor/gpt-6-luna",
+                                            content="vercel wins")))])
+
+    async def go(client):
+        return await _http(client, "post", "/v1/chat/completions",
+                          {"model": "gpt-6-luna", "messages": MESSAGES})
+
+    resp = asyncio.run(_go(app, go))
+    assert json.loads(resp.body)["choices"][0]["message"]["content"] == \
+        "vercel wins"
+    assert ps.calls == []          # puter is second in line, never reached
+    assert fake.chat_calls == []
+
+
+def test_gateway_default_falls_to_puter_when_vercel_misses():
+    puter, ps = _puter_stub(
+        catalog=("gpt-6-luna",),
+        responses=[FakeResp(200, json.dumps({"success": True, "result": {
+            "choices": [{"index": 0, "message": {"role": "assistant",
+                                                 "content": "puter-answer"},
+                        "finish_reason": "stop"}]}}))])
+    app, fake, s = _app(puter=puter, catalog=("anthropic/claude-opus-4.5",))
+
+    async def go(client):
+        return await _http(client, "post", "/v1/chat/completions",
+                          {"model": "gpt-6-luna", "messages": MESSAGES})
+
+    resp = asyncio.run(_go(app, go))
+    assert json.loads(resp.body)["choices"][0]["message"]["content"] == \
+        "puter-answer"
+    assert s.calls == []           # vercel catalog missed (no vendor '/')
+    assert fake.chat_calls == []
+
+
+def test_gateway_default_without_any_provider_key_stays_copilot():
+    app, fake, s = _app(key="", catalog=())
+
+    async def go(client):
+        return await _http(client, "post", "/v1/chat/completions",
+                          {"model": "claude-opus-4.5", "messages": MESSAGES})
+
+    resp = asyncio.run(_go(app, go))
+    assert json.loads(resp.body)["choices"][0]["message"]["content"] == \
+        "copilot-answer"
+    assert s.calls == []                              # vercel inert
+    assert fake.chat_calls[0][2]["model"] == "claude-opus-4-5"  # normalized
+
+
+def test_gateway_github_prefix_forces_copilot_over_vercel():
+    app, fake, s = _app(catalog=("gpt-5.6-luna",))
+
+    async def go(client):
+        return await _http(client, "post", "/v1/chat/completions",
+                          {"model": "github:gpt-5.6-luna", "messages": MESSAGES})
+
+    resp = asyncio.run(_go(app, go))
+    assert json.loads(resp.body)["choices"][0]["message"]["content"] == \
+        "copilot-answer"
+    assert s.calls == []                              # vercel not used
+    assert fake.chat_calls[0][2]["model"] == "gpt-5.6-luna"  # prefix stripped
+
+
+def test_gateway_github_prefix_normalizes_like_copilot_ids():
+    app, fake, s = _app()
+
+    async def go(client):
+        return await _http(client, "post", "/v1/chat/completions",
+                          {"model": "github:claude-opus-4.6[1m]",
+                           "messages": MESSAGES})
+
+    resp = asyncio.run(_go(app, go))
+    assert resp.status == 200
+    assert fake.chat_calls[0][2]["model"] == "claude-opus-4-6"
+    assert s.calls == []
+
+
+def test_gateway_default_route_on_messages_stays_copilot():
+    """/v1/messages is Anthropic-format: vercel/puter are chat-only, so the
+    default route must not hijack it."""
+    app, fake, s = _app()
+    fake.messages_responses.append(FakeResp(200, json.dumps(
+        {"id": "msg_1", "type": "message", "role": "assistant",
+         "content": [{"type": "text", "text": "copilot-msg"}]})))
+
+    async def go(client):
+        return await _http(client, "post", "/v1/messages",
+                          {"model": "claude-opus-4.5", "max_tokens": 8,
+                           "messages": MESSAGES})
+
+    resp = asyncio.run(_go(app, go))
+    assert resp.status == 200
+    assert json.loads(resp.body)["content"][0]["text"] == "copilot-msg"
+    assert fake.messages_calls[0][2]["model"] == "claude-opus-4-5"
     assert s.calls == []

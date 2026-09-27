@@ -466,38 +466,13 @@ async def _proxy_llm(request: web.Request,
     except Exception:
         return web.json_response(
             {"error": {"message": "invalid JSON body"}}, status=400)
-    if payload.get("model"):
-        payload = dict(payload, model=normalize_model_id(payload["model"]))
+    model_raw = str(payload.get("model") or "")
     stream = bool(payload.get("stream"))
     vision = has_vision(payload)
-
-    # --- puter routing (third provider) ---
-    puter = request.app.get("puter")
-    route: Optional[str] = None
-    model_raw = payload.get("model") or ""
-    if model_raw.startswith("puter:"):
-        if puter is None or not puter.enabled:
-            return web.json_response(
-                {"error": {"message":
-                           "Puter provider disabled — set PUTER_AUTH_TOKEN "
-                           "in .env"}, "type": "config"}, status=400)
-        route = model_raw[len("puter:"):]
-    elif (endpoint == "chat" and puter is not None and puter.enabled
-          and puter.fallback and model_raw):
-        # fallback flag (default off): unknown-to-copilot + in puter catalog
-        copilot_data = await pool.get_models()  # cached list
-        copilot_ids = {m.get("id") for m in copilot_data.get("data") or []}
-        route = await puter.fallback_route(model_raw, copilot_ids)
-    if route is not None:
-        if endpoint != "chat":
-            return web.json_response(
-                {"error": {"message":
-                           "Puter supports /v1/chat/completions only"}},
-                status=400)
-        return await _puter_proxy(request, puter, payload, route)
-
-    # --- vercel routing (fourth provider) ---
     vercel = request.app.get("vercel")
+    puter = request.app.get("puter")
+
+    # --- explicit vercel: prefix (unchanged) ---
     if model_raw.startswith("vercel:"):
         if vercel is None or not vercel.enabled:
             return web.json_response(
@@ -516,6 +491,45 @@ async def _proxy_llm(request: web.Request,
                            "Vercel supports /v1/chat/completions only"}},
                 status=400)
         return await _vercel_proxy(request, vercel, payload, vroute)
+
+    # --- explicit puter: prefix (unchanged) ---
+    if model_raw.startswith("puter:"):
+        if puter is None or not puter.enabled:
+            return web.json_response(
+                {"error": {"message":
+                           "Puter provider disabled — set PUTER_AUTH_TOKEN "
+                           "in .env"}, "type": "config"}, status=400)
+        proute = model_raw[len("puter:"):]
+        if endpoint != "chat":
+            return web.json_response(
+                {"error": {"message":
+                           "Puter supports /v1/chat/completions only"}},
+                status=400)
+        return await _puter_proxy(request, puter, payload, proute)
+
+    # --- default route for unprefixed ids: copilot is the LAST resort ---
+    # vercel catalog -> puter (only with PUTER_FALLBACK=true) -> copilot.
+    # github:<id> bypasses both and forces copilot (prefix stripped, id then
+    # normalized exactly like a bare copilot id). Matching uses the raw id:
+    # normalize_model_id rewrites claude-opus-4.5 -> claude-opus-4-5, a copilot
+    # convention that would never match the vercel/puter catalogs. /v1/messages
+    # stays copilot-native (both providers are chat-only upstreams).
+    forced_copilot = model_raw.startswith("github:")
+    bare = model_raw[len("github:"):] if forced_copilot else model_raw
+    if endpoint == "chat" and bare and not forced_copilot:
+        if vercel is not None and vercel.enabled:
+            vdefault = await vercel.resolve(bare)
+            if vdefault is not None:
+                return await _vercel_proxy(request, vercel, payload, vdefault)
+        if puter is not None and puter.enabled and puter.fallback:
+            copilot_data = await pool.get_models()  # cached list
+            copilot_ids = {m.get("id") for m in copilot_data.get("data") or []}
+            proute = await puter.fallback_route(normalize_model_id(bare),
+                                                copilot_ids)
+            if proute is not None:
+                return await _puter_proxy(request, puter, payload, proute)
+    if model_raw:
+        payload = dict(payload, model=normalize_model_id(bare))
 
     client = pool.client
     if endpoint == "chat":

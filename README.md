@@ -45,13 +45,43 @@ PORT=8787 python gateway.py
 
 | Prefix | Upstream | Credential | Chat | `/v1/messages` |
 |---|---|---|---|---|
-| *(none)* | GitHub Copilot (`api.githubcopilot.com`) | `accounts.json` (`gho_` device flow) | native JSON + SSE | native passthrough |
+| *(none)* | see Routing below | — | — | — |
+| `github:` | GitHub Copilot (`api.githubcopilot.com`) | `accounts.json` (`gho_` device flow) | native JSON + SSE | native passthrough |
 | `puter:` | Puter (`api.puter.com` `/drivers/call`) | `PUTER_AUTH_TOKEN` (pool: `PUTER_AUTH_TOKENS`) | JSON; `stream:true` → one-chunk SSE transform | 400 (chat-only) |
 | `vercel:` | Vercel AI Gateway (`ai-gateway.vercel.sh/v1`) | `AI_GATEWAY_API_KEY` | JSON + real OpenAI SSE passthrough | 400 (chat-only) |
 
-Unprefixed models always go to copilot. `GET /v1/models` merges the enabled
-providers' catalogs under their prefixes. Missing credentials degrade to
-copilot-only: the provider stays disabled, nothing crashes.
+### Routing
+
+Copilot is the **last resort**, not the default. A model with no prefix on
+`/v1/chat/completions` is resolved in this order:
+
+| # | Provider | Fires when |
+|---|---|---|
+| 1 | `vercel` | `VERCEL_ENABLED` (default on) **and** `AI_GATEWAY_API_KEY` set **and** the id is in the Vercel catalog — exact `vendor/model`, or the catalog's `vendor/<model>` suffix (`claude-opus-4.5` → `anthropic/claude-opus-4.5`), or already shaped `vendor/model` |
+| 2 | `puter` | `PUTER_ENABLED=true` **and** `PUTER_FALLBACK=true` **and** the id is in the Puter catalog but not in the copilot one |
+| 3 | `copilot` | everything else — the id is normalized (`claude-opus-4.5` → `claude-opus-4-5`) and sent to GitHub |
+
+`github:<id>` skips 1–2 and forces copilot (prefix stripped, then normalized).
+Explicit `vercel:` / `puter:` prefixes behave exactly as before. `/v1/messages`
+is copilot-only — puter and vercel are chat upstreams, so the default chain
+never hijacks an Anthropic-shaped body. Without any provider key the gateway is
+copilot-only, 1:1 as it used to be.
+
+`GET /v1/models` merges the enabled providers' catalogs under their prefixes.
+Missing credentials degrade to copilot-only: the provider stays disabled,
+nothing crashes.
+
+```bash
+# no prefix → Vercel AI Gateway (catalog hit), not copilot
+curl -s localhost:8787/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-opus-4.5","messages":[{"role":"user","content":"hi"}]}'
+
+# explicit copilot
+curl -s localhost:8787/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"github:gpt-5.6-luna","messages":[{"role":"user","content":"hi"}]}'
+```
 
 Endpoints:
 
@@ -120,7 +150,8 @@ Routing:
 | Request model | Goes to |
 |---|---|
 | `puter:<id>` (e.g. `puter:gpt-6-luna`) | puter always (strips prefix) |
-| anything else | copilot; with `PUTER_FALLBACK=true` models unknown to copilot *and* present in the puter catalog fall back to puter |
+| `github:<id>` | copilot always (see Routing above) |
+| anything else | vercel if its catalog knows the id, else copilot; with `PUTER_FALLBACK=true` models unknown to copilot *and* present in the puter catalog (and not matched by vercel) fall back to puter |
 
 `GET /v1/models` lists puter models with the `puter:` prefix (catalog cached
 ~10 min; on fetch failure the stale list is kept and the failure only logged).
@@ -153,7 +184,9 @@ copilot keeps working untouched. `VERCEL_ENABLED=false` forces it off even
 with a key present.
 
 Routing: `vercel:<vendor>/<model>` (e.g. `vercel:anthropic/claude-opus-4.5`)
-always goes upstream with the prefix stripped; anything else goes to copilot.
+always goes upstream with the prefix stripped. An **unprefixed** id that the
+catalog knows (exact, `vendor/<id>` suffix, or already `vendor/model`) is
+default-routed here too — see Routing above; `github:` forces copilot instead.
 Catalog is cached 1 h (`VERCEL_MODELS_TTL_SECONDS`); a fetch failure keeps the
 stale list, or answers `[]` when nothing was cached — it never raises.
 

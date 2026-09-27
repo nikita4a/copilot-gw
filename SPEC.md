@@ -244,3 +244,50 @@ content-type: application/json
 | `gateway.py::_models_handler` | слияние каталогов puter и vercel в `/v1/models`; copilot-список не меняется |
 | `gateway.py::build_app(pool, puter, vercel)` | инъекция провайдера для тестов + авто-конфиг из env в `on_startup` |
 | `test_vercel.py` | офлайн-тесты на фейке транспорта (`FakeSession`/`FakeResp`): роутинг, деградация без ключа, сбой каталога, стрим, 400 на `/v1/messages` |
+
+---
+
+<a name="default-routing"></a>
+## 9. Маршрутизация по умолчанию (copilot — крайний резерв)
+
+Порядок разрешения **без** префикса, только для `/v1/chat/completions`
+(`_proxy_llm`, блок `# --- default route: vercel -> puter -> copilot ---`):
+
+| # | Провайдер | Условие | Id наверх |
+|---|---|---|---|
+| 1 | vercel | `vercel.enabled` (нужен `AI_GATEWAY_API_KEY`) и `VercelGateway.resolve(bare)` вернул id | id из каталога, нормализация **не** применяется |
+| 2 | puter | `puter.enabled` и `puter.fallback` (`PUTER_ENABLED`/`PUTER_FALLBACK`) и `fallback_route(normalize_model_id(bare), copilot_ids)` | `puter`-id из его каталога |
+| 3 | copilot | всё остальное | `normalize_model_id(bare)` |
+
+### 9.1 Контракт `VercelGateway.resolve(model_id)`
+
+`Optional[str]`; `None` = «vercel не трогает эту модель».
+
+1. `not enabled` / пустой id / id уже с префиксом `vercel:` -> `None` (без сетевого обращения);
+2. точное совпадение с id из каталога -> тот же id;
+3. суффикс `/<model_id>`: из всех совпадений берётся то, чей вендор
+   пересекается токенами id (`deepseek-r1` -> `deepseek/deepseek-r1`), при
+   равенстве — самый короткий строковый id (детерминизм);
+4. id уже формы `vendor/model` -> passthrough (каталог динамический и может
+   быть холодным); иначе `None`.
+
+### 9.2 Нормализация и `github:`
+
+`normalize_model_id` (`claude-opus-4.5` -> `claude-opus-4-5`, срез `[1m]`)
+перенесена в copilot-ветку: матчинг дефолта идёт по **сырому** id, иначе
+точечно-суффиксный поиск по vercel-каталогу не работал бы никогда. Явные
+префиксы `vercel:` / `puter:` не нормализуются — их поведение 1:1 как в §8.
+
+`github:<id>` — единственный способ принудительно позвать copilot: префикс
+снимается, id нормализуется, цепочка 1–2 пропускается (флаг `forced_copilot`).
+Работает и на `/v1/messages`. `/v1/messages` без префикса всегда copilot:
+puter/vercel — chat-only апстримы, Anthropic-тело туда уезжать не должно.
+
+### 9.3 Якоря
+
+| Якорь | Что делает |
+|---|---|
+| `vercel.py::VercelGateway.resolve` | матчер дефолт-цепочки (контракт §9.1) |
+| `gateway.py::_proxy_llm`, `model_raw` + `forced_copilot` / `bare` | чтение сырого id, снятие `github:`, отсечение цепочки на messages |
+| `test_vercel.py::test_gateway_default_*`, `test_gateway_github_prefix_*` | приоритет vercel > puter > copilot, инертность без ключа, escape hatch |
+| `test_gateway.py::test_chat_strips_github_prefix_to_copilot`, `test_default_route_without_providers_is_unchanged_copilot` | copilot-поведение гейтвея без верель/путер-ключей не изменилось |

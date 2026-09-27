@@ -172,6 +172,30 @@ class VercelGateway:
             return model_id[len(VERCEL_PREFIX):] or None
         return None
 
+    async def resolve(self, model_id: str) -> Optional[str]:
+        """Bare (unprefixed) model id -> upstream Vercel id, or None.
+
+        Default-route matcher: exact catalog id, then a vendor suffix match
+        ("<vendor>/<model_id>" — claude-opus-4.5 finds anthropic/claude-opus-4.5),
+        then anything already shaped like vendor/model (the catalog is dynamic
+        and can be cold). Disabled provider -> None (copilot/puter unchanged).
+        Ambiguous suffix hits prefer the vendor whose name shares a token with
+        the id (deepseek-r1 -> deepseek/deepseek-r1, not openai/deepseek-r1).
+        """
+        if not self.enabled or not model_id or model_id.startswith(VERCEL_PREFIX):
+            return None
+        ids = [str(e.get("id", "")) for e in await self.list_models()]
+        if model_id in ids:
+            return model_id
+        suffix = f"/{model_id}"
+        hits = sorted(m for m in ids if m.endswith(suffix))
+        if hits:
+            tokens = set(model_id.lower().replace("/", "-").split("-"))
+            return min(hits, key=lambda m: (
+                -len(tokens & set(m.split("/")[0].lower().split("-"))),
+                len(m)))
+        return model_id if "/" in model_id else None
+
 
 if __name__ == "__main__":  # pragma: no cover - trivial smoke
     assert parse_catalog({"data": [{"id": "anthropic/claude-opus-4.5"}]}) == \
@@ -180,5 +204,14 @@ if __name__ == "__main__":  # pragma: no cover - trivial smoke
     g = VercelGateway("k", session=object())
     assert g.route("vercel:anthropic/claude-opus-4.5") == "anthropic/claude-opus-4.5"
     assert g.route("gpt-5.6-luna") is None
+    import asyncio
+    g.models_cache = {"entries": [{"id": "anthropic/claude-opus-4.5"}],
+                      "fetched_at": time.time()}
+    assert asyncio.run(g.resolve("anthropic/claude-opus-4.5")) == \
+        "anthropic/claude-opus-4.5"
+    assert asyncio.run(g.resolve("claude-opus-4.5")) == "anthropic/claude-opus-4.5"
+    assert asyncio.run(g.resolve("mistral/large")) == "mistral/large"
+    assert asyncio.run(g.resolve("gpt-5.6-luna")) is None
+    assert asyncio.run(VercelGateway("", session=object()).resolve("openai/gpt-4o")) is None
     assert VercelGateway("", session=object()).enabled is False
     print("vercel.py self-check OK")
