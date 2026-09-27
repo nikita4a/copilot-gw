@@ -45,9 +45,9 @@ Endpoints:
 
 | Route | Behavior |
 |---|---|
-| `GET /v1/models` | live upstream list (30 min cache, static fallback) |
-| `POST /v1/chat/completions` | non-stream JSON + SSE passthrough (`stream:true`) |
-| `POST /v1/messages` | Anthropic — native upstream passthrough (non-stream + stream) |
+| `GET /v1/models` | live upstream list (30 min cache, static fallback) + puter catalog when enabled (`puter:` prefix) |
+| `POST /v1/chat/completions` | non-stream JSON + SSE passthrough (`stream:true`); copilot native, puter via non-stream→SSE transform |
+| `POST /v1/messages` | Anthropic — native upstream passthrough (non-stream + stream); puter models rejected (chat-only provider) |
 | `GET /healthz` | liveness |
 
 Pool: round-robin; on 429/403 the account goes into cooldown (`COOLDOWN_SECONDS`,
@@ -59,13 +59,55 @@ Optional inbound auth: `GATEWAY_KEY=... python gateway.py` — requires
 `Authorization: Bearer <key>` or `x-api-key: <key>` on every request.
 
 Env: `PORT` (default 8787), `ACCOUNTS_PATH`, `COOLDOWN_SECONDS`,
-`MODELS_TTL_SECONDS`, `LOG_LEVEL`. A `.env` file is loaded if python-dotenv is
-installed.
+`MODELS_TTL_SECONDS`, `LOG_LEVEL`; puter: `PUTER_AUTH_TOKEN`,
+`PUTER_AUTH_TOKENS`, `PUTER_ENABLED`, `PUTER_FALLBACK`,
+`PUTER_MODELS_TTL_SECONDS` (see below). A `.env` file is loaded if
+python-dotenv is installed.
+
+## Puter provider (third upstream)
+
+Puter (`api.puter.com`) adds GPT-6 luna/astra/sol, claude-*, `openai:*` and
+~1030 more models behind the same OpenAI-compat API. Driver contract verified
+against the live API: `POST /drivers/call` with
+`{"interface":"puter-chat-completion","driver":"ai-chat","method":"complete",
+"args":{openai payload}}`, `Authorization: Bearer <auth_token>`; responses come
+wrapped in `{"success":true,"result":{...}}` which the gateway unwraps
+(robust parser tolerates the bare OpenAI shape too).
+
+Enable — put your token in `.env` (DevTools → Local Storage → `auth_token`
+on puter.com) and restart:
+
+```bash
+PUTER_AUTH_TOKEN=eyJ...   # in .env; PUTER_AUTH_TOKENS for a round-robin pool
+```
+
+If `PUTER_ENABLED` is unset the provider turns on automatically once a token
+is present; `PUTER_ENABLED=false` keeps copilot-only routing.
+
+Routing:
+
+| Request model | Goes to |
+|---|---|
+| `puter:<id>` (e.g. `puter:gpt-6-luna`) | puter always (strips prefix) |
+| anything else | copilot; with `PUTER_FALLBACK=true` models unknown to copilot *and* present in the puter catalog fall back to puter |
+
+`GET /v1/models` lists puter models with the `puter:` prefix (catalog cached
+~10 min; on fetch failure the stale list is kept and the failure only logged).
+`401 token_auth_failed` → clear error
+`{"error":{"message":"Puter token invalid/expired","type":"auth"}}` (status 401);
+`429` rotates to the next pool token and returns 429 only when all are exhausted.
+
+**Streaming**: `stream:true` on a `puter:` model is answered as a one-chunk
+SSE transform — the gateway asks puter non-stream and emits a single
+`chat.completion.chunk` + `data: [DONE]`. This is the simplest working option
+because the puter driver wraps its own SSE inside the `result` envelope, so a
+raw SSE passthrough would not be OpenAI-compatible. Upstream puter caps: ~30
+req/10s, 3 concurrent (free tier).
 
 ## Tests
 
 ```bash
-pytest test_gateway.py    # offline: fakes the upstream client
+pytest test_gateway.py test_puter.py   # offline: fakes the upstream clients
 ```
 
 ## Known environment quirks

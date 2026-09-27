@@ -25,6 +25,13 @@ from copilot import (
     has_vision,
     normalize_model_id,
 )
+from puter import (
+    PuterProvider,
+    puter_enabled,
+    puter_tokens,
+    parse_result,
+    extract_content,
+)
 
 log = logging.getLogger("copilot-gw")
 
@@ -293,6 +300,16 @@ async def _models_handler(request: web.Request) -> web.Response:
     except QuotaExhausted:
         return web.json_response(
             {"error": {"message": "all accounts cooling down"}}, status=429)
+    puter = request.app.get("puter")
+    if puter is not None and puter.enabled:
+        try:
+            pdata = await puter.get_models()
+            if pdata.get("data"):
+                data = dict(
+                    data,
+                    data=list(data.get("data") or []) + list(pdata["data"]))
+        except Exception as e:  # noqa: BLE001 - catalog merge is best-effort
+            log.warning("puter models merge failed: %s", e)
     return web.json_response(data)
 
 
@@ -307,6 +324,82 @@ async def _send_with_refresh(pool: AccountPool, account: Account,
             token = await pool.get_token(account, force=True)
             return await send(token, account), None
         return None, e
+
+
+# --- puter (third provider) ---
+
+async def _puter_sse(request: web.Request, body: dict,
+                     model: str) -> web.StreamResponse:
+    """One-chunk SSE transform of a non-stream puter response.
+
+    Simplest working streaming: ask puter with stream:false (the driver
+    wraps SSE in its own envelope, raw passthrough would not be
+    OpenAI-compatible) and emit a single completion chunk + [DONE].
+    """
+    result = parse_result(body)
+    chunk = {
+        "id": result.get("id") or "puter-chat",
+        "object": "chat.completion.chunk",
+        "created": result.get("created") or int(time.time()),
+        "model": model,
+        "choices": [{"index": 0,
+                     "delta": {"content": extract_content(result)},
+                     "finish_reason": "stop"}],
+    }
+    if result.get("usage"):
+        chunk["usage"] = result["usage"]
+    stream = web.StreamResponse(status=200, headers={
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        "x-accel-buffering": "no",
+    })
+    await stream.prepare(request)
+    await stream.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                       .encode())
+    await stream.write(b"data: [DONE]\n\n")
+    await stream.write_eof()
+    return stream
+
+
+async def _puter_proxy(request: web.Request, provider: PuterProvider,
+                       payload: dict, upstream_model: str) -> web.Response:
+    """OpenAI chat completions via the puter provider; maps 401/429 to clear
+    errors, 502 on transport/parse failures, stream -> SSE transform."""
+    client_stream = bool(payload.get("stream"))
+    upstream = dict(payload, model=upstream_model, stream=False)
+    try:
+        status, _, text = await provider.chat(upstream)
+    except ApiError as e:
+        log.warning("puter chat upstream error: %s", e)
+        return web.json_response(
+            {"error": {"message": f"Puter upstream error: {e.body[:300]}"}},
+            status=502)
+    except Exception as e:  # noqa: BLE001 - surface as 502
+        log.warning("puter chat error: %s", e)
+        return web.json_response(
+            {"error": {"message": f"Puter upstream error: {e}"}}, status=502)
+    if status == 401:
+        return web.json_response(
+            {"error": {"message": "Puter token invalid/expired",
+                       "type": "auth"}}, status=401)
+    if status == 429:
+        return web.json_response(
+            {"error": {"message": "Puter rate limit exceeded",
+                       "type": "rate_limit"}}, status=429)
+    if status != 200:
+        return web.json_response(
+            {"error": {"message":
+                       f"Puter upstream error {status}: {text[:500]}"}},
+            status=status if 400 <= status < 500 else 502)
+    try:
+        body = json.loads(text or "{}")
+    except ValueError:
+        return web.json_response(
+            {"error": {"message": "Puter returned non-JSON response"}},
+            status=502)
+    if client_stream:
+        return await _puter_sse(request, body, upstream_model)
+    return web.json_response(parse_result(body))
 
 
 async def _proxy_llm(request: web.Request,
@@ -325,6 +418,31 @@ async def _proxy_llm(request: web.Request,
         payload = dict(payload, model=normalize_model_id(payload["model"]))
     stream = bool(payload.get("stream"))
     vision = has_vision(payload)
+
+    # --- puter routing (third provider) ---
+    puter = request.app.get("puter")
+    route: Optional[str] = None
+    model_raw = payload.get("model") or ""
+    if model_raw.startswith("puter:"):
+        if puter is None or not puter.enabled:
+            return web.json_response(
+                {"error": {"message":
+                           "Puter provider disabled — set PUTER_AUTH_TOKEN "
+                           "in .env"}, "type": "config"}, status=400)
+        route = model_raw[len("puter:"):]
+    elif (endpoint == "chat" and puter is not None and puter.enabled
+          and puter.fallback and model_raw):
+        # fallback flag (default off): unknown-to-copilot + in puter catalog
+        copilot_data = await pool.get_models()  # cached list
+        copilot_ids = {m.get("id") for m in copilot_data.get("data") or []}
+        route = await puter.fallback_route(model_raw, copilot_ids)
+    if route is not None:
+        if endpoint != "chat":
+            return web.json_response(
+                {"error": {"message":
+                           "Puter supports /v1/chat/completions only"}},
+                status=400)
+        return await _puter_proxy(request, puter, payload, route)
 
     client = pool.client
     if endpoint == "chat":
@@ -392,7 +510,8 @@ async def _health_handler(_: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-def build_app(pool: Optional[AccountPool] = None) -> web.Application:
+def build_app(pool: Optional[AccountPool] = None,
+              puter: Optional[PuterProvider] = None) -> web.Application:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -401,6 +520,7 @@ def build_app(pool: Optional[AccountPool] = None) -> web.Application:
     app["accounts_path"] = ACCOUNTS_PATH
     app["session"] = None
     app["pool"] = pool
+    app["puter"] = puter
 
     async def on_startup(app: web.Application) -> None:
         if app.get("pool") is not None:
@@ -413,6 +533,11 @@ def build_app(pool: Optional[AccountPool] = None) -> web.Application:
         if not pool.accounts:
             log.warning("no accounts loaded from %s — add via add_account.py",
                         app["accounts_path"])
+        if app["puter"] is None and puter_enabled():
+            app["puter"] = PuterProvider(puter_tokens(),
+                                         session=app["session"])
+            log.info("puter provider enabled (%d token(s) in pool)",
+                     len(app["puter"].tokens))
         app["client"] = client
         app["pool"] = pool
 
