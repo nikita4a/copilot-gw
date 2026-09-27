@@ -196,3 +196,51 @@ openai-intent: "conversation-agent" | "model-access" | "messages-proxy"
 x-interaction-type: "conversation-agent" | "model-access" | "messages-proxy" | "conversation-subagent" | "conversation-compaction"
 device id: uuid4().lower()  // Windows: реестр \SOFTWARE\Microsoft\DeveloperTools deviceid; *nix: файл
 ```
+
+## 8. Vercel AI Gateway — четвёртый провайдер (`vercel:`)
+
+<a name="vercel"></a>
+### 8.1 Контракт
+
+OpenAI-совместимый API, base `https://ai-gateway.vercel.sh/v1` (переопределяется
+`VERCEL_AI_GATEWAY`). Проверено живьём 2026-09-27:
+
+```http
+GET https://ai-gateway.vercel.sh/v1/models
+-> 200 {"object":"list","data":[{"id":"anthropic/claude-opus-4.5","object":"model",
+     "created":<unix>,"owned_by":"anthropic","name":"Claude Opus 4.5", ...}]}
+```
+
+Каталог отдаётся без ключа (200, 391 модель на момент проверки). id моделей —
+`vendor/model`: `anthropic/claude-opus-4.5`, `openai/gpt-5.3-codex`,
+`google/gemini-3.1-pro-preview`. Каталог динамический — единственный источник
+истины, хардкода списка в репо нет.
+
+```http
+POST https://ai-gateway.vercel.sh/v1/chat/completions
+Authorization: Bearer {AI_GATEWAY_API_KEY}
+content-type: application/json
+
+{"model":"anthropic/claude-opus-4.5","messages":[...],"stream":true}
+```
+
+Ключ из дашборда `https://vercel.com/dashboard/ai-gateway`, env
+`AI_GATEWAY_API_KEY`. Free-кредиты: $5/месяц на новый ключ, без карты.
+`stream:true` -> обычный OpenAI SSE (`data: {chat.completion.chunk}` …
+`data: [DONE]`), поэтому в шлюзе это сырой passthrough (`_stream_pass`), в
+отличие от puter с его конвертом `{"success":true,"result":{...}}`.
+
+<a name="vercel-anchors"></a>
+### 8.2 Якоря в коде
+
+| Якорь | Что делает |
+|---|---|
+| `vercel.py::vercel_key` / `vercel_enabled` | читают `AI_GATEWAY_API_KEY`; без ключа провайдер выключен — деградация в copilot-only, кода не падает |
+| `vercel.py::VercelGateway.chat(model, messages, stream=True, **extra)` | один `POST /v1/chat/completions`; при `stream=True` возвращает сырой ответ (закрывает шлюз), иначе текст |
+| `vercel.py::VercelGateway.list_models()` | кэш каталога, TTL 1ч (`VERCEL_MODELS_TTL_SECONDS`); сетевой сбой -> stale-кэш или `[]`, наружу исключений не выпускает |
+| `vercel.py::VercelGateway.get_models` / `openai_model_entry` | OpenAI-payload `/v1/models` с префиксом `vercel:` |
+| `gateway.py::_proxy_llm`, блок `# --- vercel routing (fourth provider) ---` | `vercel:<id>` -> upstream id (strip) до copilot-цикла; без ключа 400 `{"type":"config"}`; `/v1/messages` 400 |
+| `gateway.py::_vercel_proxy` | JSON + SSE passthrough; 401 -> `type:auth`, 429 -> `type:rate_limit`, транспорт/парсинг -> 502 |
+| `gateway.py::_models_handler` | слияние каталогов puter и vercel в `/v1/models`; copilot-список не меняется |
+| `gateway.py::build_app(pool, puter, vercel)` | инъекция провайдера для тестов + авто-конфиг из env в `on_startup` |
+| `test_vercel.py` | офлайн-тесты на фейке транспорта (`FakeSession`/`FakeResp`): роутинг, деградация без ключа, сбой каталога, стрим, 400 на `/v1/messages` |

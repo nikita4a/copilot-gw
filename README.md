@@ -41,13 +41,25 @@ integration (see SPEC.md §3).
 PORT=8787 python gateway.py
 ```
 
+## Providers
+
+| Prefix | Upstream | Credential | Chat | `/v1/messages` |
+|---|---|---|---|---|
+| *(none)* | GitHub Copilot (`api.githubcopilot.com`) | `accounts.json` (`gho_` device flow) | native JSON + SSE | native passthrough |
+| `puter:` | Puter (`api.puter.com` `/drivers/call`) | `PUTER_AUTH_TOKEN` (pool: `PUTER_AUTH_TOKENS`) | JSON; `stream:true` → one-chunk SSE transform | 400 (chat-only) |
+| `vercel:` | Vercel AI Gateway (`ai-gateway.vercel.sh/v1`) | `AI_GATEWAY_API_KEY` | JSON + real OpenAI SSE passthrough | 400 (chat-only) |
+
+Unprefixed models always go to copilot. `GET /v1/models` merges the enabled
+providers' catalogs under their prefixes. Missing credentials degrade to
+copilot-only: the provider stays disabled, nothing crashes.
+
 Endpoints:
 
 | Route | Behavior |
 |---|---|
-| `GET /v1/models` | live upstream list (30 min cache, static fallback) + puter catalog when enabled (`puter:` prefix) |
-| `POST /v1/chat/completions` | non-stream JSON + SSE passthrough (`stream:true`); copilot native, puter via non-stream→SSE transform |
-| `POST /v1/messages` | Anthropic — native upstream passthrough (non-stream + stream); puter models rejected (chat-only provider) |
+| `GET /v1/models` | live copilot list (30 min cache, static fallback) + enabled puter (`puter:`) and vercel (`vercel:`) catalogs |
+| `POST /v1/chat/completions` | non-stream JSON + SSE passthrough (`stream:true`); copilot/vercel native SSE, puter via non-stream→SSE transform |
+| `POST /v1/messages` | Anthropic — native copilot passthrough (non-stream + stream); puter and vercel models rejected (chat-only providers) |
 | `GET /healthz` | liveness |
 
 Pool: round-robin; on 429/403 the account goes into cooldown (`COOLDOWN_SECONDS`,
@@ -61,8 +73,27 @@ Optional inbound auth: `GATEWAY_KEY=... python gateway.py` — requires
 Env: `PORT` (default 8787), `ACCOUNTS_PATH`, `COOLDOWN_SECONDS`,
 `MODELS_TTL_SECONDS`, `LOG_LEVEL`; puter: `PUTER_AUTH_TOKEN`,
 `PUTER_AUTH_TOKENS`, `PUTER_ENABLED`, `PUTER_FALLBACK`,
-`PUTER_MODELS_TTL_SECONDS` (see below). A `.env` file is loaded if
-python-dotenv is installed.
+`PUTER_MODELS_TTL_SECONDS`; vercel: `AI_GATEWAY_API_KEY`, `VERCEL_ENABLED`,
+`VERCEL_MODELS_TTL_SECONDS`, `VERCEL_TIMEOUT_SECONDS` (see below). A `.env`
+file is loaded if python-dotenv is installed.
+
+### Quickstart (all three providers)
+
+```bash
+pip install -r requirements.txt
+python add_account.py --label acc1                    # copilot: device flow
+cp .env.example .env                                  # then fill in keys:
+#   PUTER_AUTH_TOKEN=eyJ...        puter.com -> DevTools -> Local Storage
+#   AI_GATEWAY_API_KEY=ai_...      https://vercel.com/dashboard/ai-gateway
+python gateway.py                                     # PORT=8787 by default
+curl -s localhost:8787/v1/models | python -m json.tool | grep '"id"' | head
+curl -s localhost:8787/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"vercel:anthropic/claude-opus-4.5","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Without any provider key the gateway still runs copilot-only; a `vercel:`
+request then answers 400 with `{"type":"config"}` instead of crashing.
+
 
 ## Puter provider (third upstream)
 
@@ -104,10 +135,38 @@ because the puter driver wraps its own SSE inside the `result` envelope, so a
 raw SSE passthrough would not be OpenAI-compatible. Upstream puter caps: ~30
 req/10s, 3 concurrent (free tier).
 
+## Vercel AI Gateway provider (`vercel:` prefix)
+
+[Vercel AI Gateway](https://vercel.com/docs/ai-gateway) is a plain
+OpenAI-compatible API at `https://ai-gateway.vercel.sh/v1`: dynamic catalog
+(`GET /models`, ~391 models, ids are `vendor/model` — `anthropic/claude-opus-4.5`,
+`openai/gpt-5.3-codex`, `google/gemini-3-pro`…) and `POST /chat/completions`.
+Free credits: **$5 per month on a new key, no card required**.
+
+```bash
+AI_GATEWAY_API_KEY=ai_gw_...   # https://vercel.com/dashboard/ai-gateway
+```
+
+The key is optional: with no key the provider is disabled, `/v1/models` lists
+no `vercel:` entries and a `vercel:` model answers 400 `{"type":"config"}` —
+copilot keeps working untouched. `VERCEL_ENABLED=false` forces it off even
+with a key present.
+
+Routing: `vercel:<vendor>/<model>` (e.g. `vercel:anthropic/claude-opus-4.5`)
+always goes upstream with the prefix stripped; anything else goes to copilot.
+Catalog is cached 1 h (`VERCEL_MODELS_TTL_SECONDS`); a fetch failure keeps the
+stale list, or answers `[]` when nothing was cached — it never raises.
+
+**Streaming**: `stream:true` is a raw SSE passthrough — the upstream already
+emits OpenAI-format `chat.completion.chunk` events, so no transform is needed
+(unlike puter's envelope). `401` → `{"error":{"message":"Vercel AI Gateway key
+invalid/missing","type":"auth"}}`, `429` → `type: rate_limit`, transport/parse
+failures → `502`.
+
 ## Tests
 
 ```bash
-pytest test_gateway.py test_puter.py   # offline: fakes the upstream clients
+pytest test_gateway.py test_puter.py test_vercel.py   # offline: fakes the upstream clients
 ```
 
 ## Known environment quirks

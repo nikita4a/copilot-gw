@@ -32,6 +32,7 @@ from puter import (
     parse_result,
     extract_content,
 )
+from vercel import VercelGateway, vercel_enabled
 
 log = logging.getLogger("copilot-gw")
 
@@ -300,16 +301,18 @@ async def _models_handler(request: web.Request) -> web.Response:
     except QuotaExhausted:
         return web.json_response(
             {"error": {"message": "all accounts cooling down"}}, status=429)
-    puter = request.app.get("puter")
-    if puter is not None and puter.enabled:
+    for name in ("puter", "vercel"):
+        provider = request.app.get(name)
+        if provider is None or not provider.enabled:
+            continue
         try:
-            pdata = await puter.get_models()
+            pdata = await provider.get_models()
             if pdata.get("data"):
                 data = dict(
                     data,
                     data=list(data.get("data") or []) + list(pdata["data"]))
         except Exception as e:  # noqa: BLE001 - catalog merge is best-effort
-            log.warning("puter models merge failed: %s", e)
+            log.warning("%s models merge failed: %s", name, e)
     return web.json_response(data)
 
 
@@ -402,6 +405,55 @@ async def _puter_proxy(request: web.Request, provider: PuterProvider,
     return web.json_response(parse_result(body))
 
 
+async def _vercel_proxy(request: web.Request, provider: VercelGateway,
+                        payload: dict, upstream_model: str) -> web.Response:
+    """OpenAI chat completions through Vercel AI Gateway.
+
+    Unlike puter the upstream streams plain OpenAI SSE, so stream:true is a
+    raw passthrough (_stream_pass) — no chunk synthesis. 401/429 map to clear
+    errors, transport/parse failures to 502.
+    """
+    client_stream = bool(payload.get("stream"))
+    extra = {k: v for k, v in payload.items()
+             if k not in ("model", "messages", "stream")}
+    try:
+        status, _, body = await provider.chat(
+            upstream_model, payload.get("messages") or [],
+            stream=client_stream, **extra)
+    except ApiError as e:
+        log.warning("vercel chat upstream error: %s", e)
+        return web.json_response(
+            {"error": {"message": f"Vercel upstream error: {e.body[:300]}"}},
+            status=502)
+    except Exception as e:  # noqa: BLE001 - surface as 502
+        log.warning("vercel chat error: %s", e)
+        return web.json_response(
+            {"error": {"message": f"Vercel upstream error: {e}"}}, status=502)
+    if client_stream and status == 200:
+        return await _stream_pass(request, body, status)
+    text = body if isinstance(body, str) else await body.text()
+    if status == 401:
+        return web.json_response(
+            {"error": {"message": "Vercel AI Gateway key invalid/missing",
+                       "type": "auth"}}, status=401)
+    if status == 429:
+        return web.json_response(
+            {"error": {"message": "Vercel AI Gateway rate limit exceeded",
+                       "type": "rate_limit"}}, status=429)
+    if status != 200:
+        return web.json_response(
+            {"error": {"message":
+                       f"Vercel upstream error {status}: {text[:500]}"}},
+            status=status if 400 <= status < 500 else 502)
+    try:
+        out = json.loads(text or "{}")
+    except ValueError:
+        return web.json_response(
+            {"error": {"message": "Vercel returned non-JSON response"}},
+            status=502)
+    return web.json_response(out)
+
+
 async def _proxy_llm(request: web.Request,
                      endpoint: str) -> web.Response:
     """Shared chat-completions / messages loop: rotate on 429/403, stream
@@ -443,6 +495,27 @@ async def _proxy_llm(request: web.Request,
                            "Puter supports /v1/chat/completions only"}},
                 status=400)
         return await _puter_proxy(request, puter, payload, route)
+
+    # --- vercel routing (fourth provider) ---
+    vercel = request.app.get("vercel")
+    if model_raw.startswith("vercel:"):
+        if vercel is None or not vercel.enabled:
+            return web.json_response(
+                {"error": {"message":
+                           "Vercel AI Gateway disabled — set AI_GATEWAY_API_KEY "
+                           "in .env"}, "type": "config"}, status=400)
+        vroute = vercel.route(model_raw)
+        if not vroute:
+            return web.json_response(
+                {"error": {"message":
+                           "vercel: needs a model id (vercel:<vendor>/<model>)"},
+                 "type": "invalid_request"}, status=400)
+        if endpoint != "chat":
+            return web.json_response(
+                {"error": {"message":
+                           "Vercel supports /v1/chat/completions only"}},
+                status=400)
+        return await _vercel_proxy(request, vercel, payload, vroute)
 
     client = pool.client
     if endpoint == "chat":
@@ -511,7 +584,8 @@ async def _health_handler(_: web.Request) -> web.Response:
 
 
 def build_app(pool: Optional[AccountPool] = None,
-              puter: Optional[PuterProvider] = None) -> web.Application:
+              puter: Optional[PuterProvider] = None,
+              vercel: Optional[VercelGateway] = None) -> web.Application:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -521,6 +595,7 @@ def build_app(pool: Optional[AccountPool] = None,
     app["session"] = None
     app["pool"] = pool
     app["puter"] = puter
+    app["vercel"] = vercel
 
     async def on_startup(app: web.Application) -> None:
         if app.get("pool") is not None:
@@ -538,6 +613,9 @@ def build_app(pool: Optional[AccountPool] = None,
                                          session=app["session"])
             log.info("puter provider enabled (%d token(s) in pool)",
                      len(app["puter"].tokens))
+        if app["vercel"] is None and vercel_enabled():
+            app["vercel"] = VercelGateway(session=app["session"])
+            log.info("vercel ai gateway provider enabled (key from env)")
         app["client"] = client
         app["pool"] = pool
 
